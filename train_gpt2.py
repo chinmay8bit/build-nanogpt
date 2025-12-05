@@ -282,7 +282,9 @@ if __name__ == "__main__":
         torch.set_float32_matmul_precision("high")
 
     # model init
-    model = GPT(GPTConfig())
+    model = GPT(
+        GPTConfig(vocab_size=50304)
+    )  # 50304 = 128 * 393 = 2^7 * 393 (a nice number, better for cuda calculations)
     model.to(device)
     # use compiled model
     model.compile()
