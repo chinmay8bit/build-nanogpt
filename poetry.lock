@@ -2188,7 +2188,7 @@ description = "A language and compiler for custom Deep Learning operations"
 optional = false
 python-versions = "<3.15,>=3.10"
 groups = ["main"]
-markers = "platform_system == \"Linux\""
+markers = "platform_system == \"Linux\" or sys_platform == \"linux\""
 files = [
     {file = "triton-3.5.1-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:f63e34dcb32d7bd3a1d0195f60f30d2aee8b08a69a0424189b71017e23dfc3d2"},
     {file = "triton-3.5.1-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5fc53d849f879911ea13f4a877243afc513187bc7ee92d1f2c0f1ba3169e3c94"},
@@ -2218,6 +2218,7 @@ description = "A language and compiler for custom Deep Learning operations"
 optional = false
 python-versions = "<3.15,>=3.10"
 groups = ["main"]
+markers = "sys_platform == \"win32\""
 files = [
     {file = "triton_windows-3.5.1.post21-cp310-cp310-win_amd64.whl", hash = "sha256:4412ddbd9a8986294389fd8852fec4aa502ae9df99e52ac2f0f1e6f7b30b1998"},
     {file = "triton_windows-3.5.1.post21-cp311-cp311-win_amd64.whl", hash = "sha256:50eb27d58795a594e2ec6e3c49540c9b3238d2c99504483762c167ddf79328d0"},
@@ -2276,4 +2277,4 @@ files = [
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.13,<3.14"
-content-hash = "a88fc9c3250e8bb85d5b1a8c83f57882d341bd0f02270f0140ebbdc2535d9b28"
+content-hash = "e0309cbae049da72c11c86c0aa5173b62883b59932d7a42cb5164766a324150f"
