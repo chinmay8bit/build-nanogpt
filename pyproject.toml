@@ -14,7 +14,7 @@ triton = {version = "^3.5.1", markers = "sys_platform == 'linux'"}
 triton-windows = {version = "^3.5.1.post21", markers = "sys_platform == 'win32'"}
 
 [tool.poetry.group.dev.dependencies]
-black = ">=25.11.0,<26.0.0"
+black = {extras = ["jupyter"], version = ">=25.11.0,<26.0.0"}
 ipykernel = "^7.1.0"
 
 [build-system]
