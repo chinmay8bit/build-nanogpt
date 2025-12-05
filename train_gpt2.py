@@ -1,9 +1,11 @@
+from typing import Optional
 from dataclasses import dataclass
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import tiktoken
 
 
 @dataclass
@@ -110,7 +112,30 @@ class GPT(nn.Module):
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx: torch.Tensor):
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight  # type: ignore # (pointer copy) they both point to the same tensor now
+
+        # init params
+        # self.apply(self._init_weights)
+        # I use this instead of self.apply because I need access to module name as well
+        for name, module in self.named_modules():
+            self._init_weights(name, module)
+
+    def _init_weights(self, name: str, module):
+        # mirror openai gpt2 initialization
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if name.endswith(
+                ".c_proj"
+            ):  # These are the final projections in the attn and mlp blocks followed by the residual connections
+                std *= 1.0 / math.sqrt(2 * self.config.n_layer)
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):  # this is the positional embeddings
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None):
         B, T = idx.size()
         assert (
             T <= self.config.block_size
@@ -126,10 +151,18 @@ class GPT(nn.Module):
         # Apply the final layernorm and lm head
         x = self.transformer.ln_f(x)  # type: ignore
         logits = self.lm_head(x)  # type: ignore # (B, T, vocab_size)
+        # Calculate loss if targets are provided
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(B * T, self.config.vocab_size),
+                targets.view(B * T),
+            )
+            return logits, loss
         return logits
 
     @classmethod
-    def from_pretrained(cls, model_type) -> GPT:
+    def from_pretrained(cls, model_type) -> "GPT":
         """Loads pretrained GPT-2 model weights from huggingface"""
         assert model_type in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"}
         from transformers import GPT2LMHeadModel
@@ -187,13 +220,100 @@ class GPT(nn.Module):
         return model
 
 
+class DataLoaderLite:
+    def __init__(self, B: int, T: int):
+        self.B = B
+        self.T = T
+
+        with open("input.txt", "r") as f:
+            text = f.read()
+
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
+
+        # loader state
+        self.current_position = 0
+
+    def next_batch(
+        self,
+    ):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position + B * T + 1]
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+        # update state
+        self.current_position += B * T
+        # reset state if next batch will be out of bounds
+        if self.current_position + B * T + 1 > len(self.tokens):
+            self.current_position = 0
+        return x, y
+
+
 if __name__ == "__main__":
+    import time
+
+    # Set device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"Using device: {device}")
+
+    # Set seed
+    torch.manual_seed(1337)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(1337)
+
+    # data loader
+    train_loader = DataLoaderLite(B=4, T=1024)
+
+    # try TF32
+    if torch.cuda.is_tf32_supported():
+        print("TF32 is supported")
+        torch.set_float32_matmul_precision("high")
+
+    # model init
+    model = GPT(GPTConfig())
+    model.to(device)
+    # use compiled model
+    model.compile()
+
+    # create optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+    # optimize
+    for i in range(10):
+        t0 = time.time()
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        # use BF16
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss.backward()
+        optimizer.step()
+        # wait for the gpu to synchronize
+        torch.cuda.synchronize()
+        t1 = time.time()
+        dt = (t1 - t0) * 1000  # time diff in ms
+        tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+        print(
+            f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}"
+        )
+
+    import sys
+
+    sys.exit(0)
+
     num_return_sequences = 5
     max_length = 30
 
-    model = GPT.from_pretrained("gpt2")
-    model.eval()
-    model.to("cuda")
+    # model = GPT.from_pretrained("gpt2")
 
     import tiktoken
 
@@ -201,7 +321,7 @@ if __name__ == "__main__":
     tokens = enc.encode("Hello, I'm a language model,")
     tokens = torch.tensor(tokens, dtype=torch.long)
     tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-    x = tokens.to("cuda")
+    x = tokens.to(device)
 
     # generate!
     torch.manual_seed(42)
