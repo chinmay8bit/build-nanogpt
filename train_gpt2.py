@@ -55,11 +55,15 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, head_size).transpose(1, 2)  # (B, nh, T, hs)
         k = k.view(B, T, self.n_head, head_size).transpose(1, 2)  # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, head_size).transpose(1, 2)  # (B, nh, T, hs)
+
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(head_size))  # (B, nh, T, T)
-        att = att.masked_fill(mask=self.bias[:, :, :T, :T] == 0, value=float("-inf"))  # type: ignore
-        att = F.softmax(att, dim=-1)
-        y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(head_size))  # (B, nh, T, T)
+        # att = att.masked_fill(mask=self.bias[:, :, :T, :T] == 0, value=float("-inf"))  # type: ignore
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # Replace with flash attention!
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         # reassemble the output of all heads into the original shape
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
         # output projection
