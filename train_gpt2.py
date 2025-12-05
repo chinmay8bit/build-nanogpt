@@ -1,6 +1,7 @@
 from typing import Optional
 from dataclasses import dataclass
 import math
+import inspect
 
 import torch
 import torch.nn as nn
@@ -223,6 +224,38 @@ class GPT(nn.Module):
 
         return model
 
+    def configure_optimizers(
+        self, weight_decay, learning_rate, device
+    ) -> torch.optim.Optimizer:
+        """
+        This adds weight decay to multi-dimensional params
+        """
+        # Pull out all trainable params
+        params_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+        # Separate out all parameters to those that will and won't experience regularizing weight decay
+        decay_params = [p for p in params_dict.values() if p.dim() > 1]
+        no_decay_params = [p for p in params_dict.values() if p.dim() <= 1]
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_no_decay_params = sum(p.numel() for p in no_decay_params)
+        print(
+            f"num weight-decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters"
+        )
+        print(
+            f"num non-weight-decayed parameter tensors: {len(no_decay_params)}, with {num_no_decay_params:,} parameters"
+        )
+        # create AdamW optimizer and use the fused version (does not loop over the parameters) if it is avaialable
+        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and "cuda" in device
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(
+            optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused
+        )  # betas and eps taken from openai paper
+        return optimizer
+
 
 class DataLoaderLite:
     def __init__(self, B: int, T: int):
@@ -312,8 +345,8 @@ if __name__ == "__main__":
         return lr / max_lr
 
     # create optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=max_lr, betas=(0.9, 0.95), eps=1e-8
+    optimizer = model.configure_optimizers(
+        weight_decay=0.1, learning_rate=max_lr, device=device
     )
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
