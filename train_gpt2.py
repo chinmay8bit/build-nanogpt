@@ -289,11 +289,36 @@ if __name__ == "__main__":
     # use compiled model
     model.compile()
 
+    # learning rate schedule from openai
+    max_lr = 6e-4
+    min_lr = max_lr * 0.1
+    warmup_steps = 10
+    max_steps = 50
+
+    def lr_lambda(step):
+        # 1) linear warmup for warmup steps
+        if step < warmup_steps:
+            return step / warmup_steps
+        # 2) after cosine decay (max steps), continue at min_lr learning rate
+        if step > max_steps:
+            return min_lr / max_lr
+        # 3) cosine decay after warmup steps (continues till max steps)
+        decay_ratio = (step - warmup_steps) / (
+            max_steps - warmup_steps
+        )  # decay_ratio goes from 0 to 1
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff goes from 1 to 0
+        lr = min_lr + coeff * (max_lr - min_lr)
+        return lr / max_lr
+
     # create optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=max_lr, betas=(0.9, 0.95), eps=1e-8
+    )
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     # optimize
-    for i in range(10):
+    for i in range(50):
         t0 = time.time()
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
@@ -302,6 +327,9 @@ if __name__ == "__main__":
         with torch.autocast(device_type=device, dtype=torch.bfloat16):
             logits, loss = model(x, y)
         loss.backward()
+        # clip gradients at 1.0 (same as openai)
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scheduler.step()
         optimizer.step()
         # wait for the gpu to synchronize
         torch.cuda.synchronize()
@@ -309,7 +337,7 @@ if __name__ == "__main__":
         dt = (t1 - t0) * 1000  # time diff in ms
         tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
         print(
-            f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}"
+            f"step {i:4d} | loss: {loss.item():.6f} | lr: {scheduler.get_last_lr()[0]:.4e} | norm: {norm.item():.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
         )
 
     import sys
