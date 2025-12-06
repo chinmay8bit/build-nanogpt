@@ -166,8 +166,7 @@ class GPT(nn.Module):
                 logits.view(B * T, self.config.vocab_size),
                 targets.view(B * T),
             )
-            return logits, loss
-        return logits
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type) -> "GPT":
@@ -334,6 +333,8 @@ class DataLoaderLite:
 if __name__ == "__main__":
     import os
     import time
+
+    import tiktoken
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -448,6 +449,9 @@ if __name__ == "__main__":
     )
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
+    # create gpt2 tokenizer (used for generation)
+    enc = tiktoken.get_encoding("gpt2")
+
     # optimize
     for step in range(max_steps):
         t0 = time.time()
@@ -472,6 +476,44 @@ if __name__ == "__main__":
                 print(
                     f"step {step:4d}/{max_steps:4d} | validation loss: {val_loss_accum.item():.6f}"
                 )
+
+        # generate from the model every 100 steps
+        if step != 0 and step % 100 == 0:
+            model.eval()
+            num_return_sequences = 4
+            max_length = 32
+            tokens = enc.encode("Hello, I'm a language model,")
+            tokens = torch.tensor(tokens, dtype=torch.long)
+            tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+            xgen = tokens.to(device)
+            # generate!
+            sample_rng = torch.Generator(
+                device=device
+            )  # creating a custom rng generator for sampling, so that training rng state (global rng state) is unaffected
+            sample_rng.manual_seed(42 + ddp_rank)  # unique seed for each gpu
+            while xgen.size(1) < max_length:
+                with torch.no_grad():
+                    logits, _ = model(xgen)  # (B, T, vocab_size)
+                    # We are only interested in the logits at the last token
+                    logits = logits[:, -1, :]  # (B, vocab_size)
+                    probs = F.softmax(logits, dim=-1)
+                    # top-k sampling (k = 50, huggingface gpt2 pipeline default setting)
+                    topk_probs, topk_indices = torch.topk(
+                        probs, k=50, dim=-1
+                    )  # (B, 50), (B, 50)
+                    next_token_idx_in_topk = torch.multinomial(
+                        topk_probs, num_samples=1, generator=sample_rng
+                    )  # (B, 1)
+                    next_token = torch.gather(
+                        topk_indices, 1, next_token_idx_in_topk
+                    )  # (B, 1)
+                    # append next token to input
+                    xgen = torch.cat((xgen, next_token), dim=1)  # (B, T+1)
+            # print the generated text
+            for i in range(num_return_sequences):
+                generated_tokens = xgen[i].tolist()
+                generated_text = enc.decode(generated_tokens)
+                print(f"rank {ddp_rank} sample {i}: {generated_text}")
 
         # training loop
         model.train()
@@ -513,45 +555,3 @@ if __name__ == "__main__":
 
     if ddp:
         dist.destroy_process_group()
-
-    import sys
-
-    sys.exit(0)
-
-    num_return_sequences = 5
-    max_length = 30
-
-    # model = GPT.from_pretrained("gpt2")
-
-    import tiktoken
-
-    enc = tiktoken.get_encoding("gpt2")
-    tokens = enc.encode("Hello, I'm a language model,")
-    tokens = torch.tensor(tokens, dtype=torch.long)
-    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-    x = tokens.to(device)
-
-    # generate!
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-
-    while x.size(1) < max_length:
-        with torch.no_grad():
-            logits = model(x)  # (B, T, vocab_size)
-            # We are only interested in the logits at the last token
-            logits = logits[:, -1, :]  # (B, vocab_size)
-            probs = F.softmax(logits, dim=-1)
-            # top-k sampling (k = 50)
-            topk_probs, topk_indices = torch.topk(
-                probs, k=50, dim=-1
-            )  # (B, 50), (B, 50)
-            next_token = torch.multinomial(topk_probs, num_samples=1)  # (B, 1)
-            next_token = torch.gather(topk_indices, 1, next_token)  # (B, 1)
-            # append next token to input
-            x = torch.cat((x, next_token), dim=1)  # (B, T+1)
-
-    # print the generated text
-    for i in range(num_return_sequences):
-        generated_tokens = x[i].tolist()
-        generated_text = enc.decode(generated_tokens)
-        print(">", generated_text)
