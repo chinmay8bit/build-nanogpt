@@ -35,12 +35,13 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
 
         # not bias, but the causal mask (obviously not a trainable param, hence put in buffer)
-        self.register_buffer(
-            "bias",
-            torch.tril(torch.ones(config.block_size, config.block_size)).view(
-                1, 1, config.block_size, config.block_size
-            ),
-        )
+        # not needed anymore as we are now using pytorch's flash attention method
+        # self.register_buffer(
+        #     "bias",
+        #     torch.tril(torch.ones(config.block_size, config.block_size)).view(
+        #         1, 1, config.block_size, config.block_size
+        #     ),
+        # )
 
     def forward(self, x):
         B, T, C = (
@@ -241,16 +242,18 @@ class GPT(nn.Module):
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_no_decay_params = sum(p.numel() for p in no_decay_params)
-        print(
-            f"num weight-decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters"
-        )
-        print(
-            f"num non-weight-decayed parameter tensors: {len(no_decay_params)}, with {num_no_decay_params:,} parameters"
-        )
+        if master_process:
+            print(
+                f"num weight-decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters"
+            )
+            print(
+                f"num non-weight-decayed parameter tensors: {len(no_decay_params)}, with {num_no_decay_params:,} parameters"
+            )
         # create AdamW optimizer and use the fused version (does not loop over the parameters) if it is avaialable
         fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and "cuda" in device
-        print(f"using fused AdamW: {use_fused}")
+        if master_process:
+            print(f"using fused AdamW: {use_fused}")
         optimizer = torch.optim.AdamW(
             optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused
         )  # betas and eps taken from openai paper
@@ -258,9 +261,11 @@ class GPT(nn.Module):
 
 
 class DataLoaderLite:
-    def __init__(self, B: int, T: int):
+    def __init__(self, B: int, T: int, process_rank: int = 0, num_processes: int = 1):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
 
         with open("input.txt", "r") as f:
             text = f.read()
@@ -269,11 +274,12 @@ class DataLoaderLite:
         tokens = enc.encode(text)
         self.tokens = torch.tensor(tokens)
 
-        print(f"loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
+        if master_process:
+            print(f"loaded {len(self.tokens)} tokens")
+            print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
 
         # loader state
-        self.current_position = 0
+        self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(
         self,
@@ -283,23 +289,60 @@ class DataLoaderLite:
         x = buf[:-1].view(B, T)
         y = buf[1:].view(B, T)
         # update state
-        self.current_position += B * T
+        self.current_position += B * T * self.num_processes
         # reset state if next batch will be out of bounds
-        if self.current_position + B * T + 1 > len(self.tokens):
-            self.current_position = 0
+        if self.current_position + (B * T * self.num_processes) + 1 > len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank
         return x, y
 
 
+# -----------------------------------------------------------------------------------------
+# simple launch:
+# poetry run python train_gpt2.py
+# DDP launch for e.g. 2 GPUs:
+# poetry run torchrun --standalone --nproc_per_node=2 train_gpt2.py
+# Note: might need to disable NCCL P2P if your provider has blocked direct GPU<->GPU P2P connections.
+# This will result in some time penalty during gradient sync, but should get the code to work.
+# NCCL_P2P_DISABLE=1 poetry run torchrun --standalone --nproc_per_node=2 train_gpt2.py
+# -----------------------------------------------------------------------------------------
 if __name__ == "__main__":
+    import os
     import time
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
 
     # Set device
-    device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = "mps"
-    print(f"Using device: {device}")
+    # set up DDP (distributed data parallel)
+    # torchrun command sets the env variables RANK, LOCAL_RANK and WORLD_SIZE
+    ddp = int(os.environ.get("RANK", -1)) != -1
+    if ddp:
+        assert torch.cuda.is_available()
+        # Set NCCL debug envs for more logs
+        # os.environ["NCCL_DEBUG"] = "INFO"
+        # os.environ["NCCL_DEBUG_SUBSYS"] = "ALL"
+        dist.init_process_group(backend="nccl")
+        ddp_rank = int(os.environ["RANK"])
+        ddp_local_rank = int(os.environ["LOCAL_RANK"])
+        ddp_world_size = int(os.environ["WORLD_SIZE"])
+        device = f"cuda:{ddp_local_rank}"
+        torch.cuda.set_device(device)
+        master_process = (
+            ddp_rank == 0
+        )  # the master process will be responsible for logging, checkpointing, etc.
+        if master_process:
+            print("Using DDP")
+    else:
+        ddp_rank = 0
+        ddp_local_rank = 0
+        ddp_world_size = 1
+        master_process = True
+        # autodetect device
+        device = "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        print(f"Using device: {device}")
 
     # Set seed
     torch.manual_seed(1337)
@@ -313,18 +356,22 @@ if __name__ == "__main__":
     B = 4  # micro batch size (set this based on your available GPU memory)
     T = 1024  # sequence length
     assert (
-        total_batch_size_in_tokens % (B * T) == 0
-    ), "total batch size in tokens must be divisible by BxT"
-    grad_accum_steps = total_batch_size_in_tokens // (B * T)
-    print(f"total desired batch size (in tokens): {total_batch_size_in_tokens}")
-    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+        total_batch_size_in_tokens % (B * T * ddp_world_size) == 0
+    ), "total batch size in tokens must be divisible by BxTxW (W = ddp world size)"
+    grad_accum_steps = total_batch_size_in_tokens // (B * T * ddp_world_size)
+    if master_process:
+        print(f"total desired batch size (in tokens): {total_batch_size_in_tokens}")
+        print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
     # data loader
-    train_loader = DataLoaderLite(B=B, T=T)
+    train_loader = DataLoaderLite(
+        B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size
+    )
 
     # try TF32
     if torch.cuda.is_tf32_supported():
-        print("TF32 is supported")
+        if master_process:
+            print("TF32 is supported")
         torch.set_float32_matmul_precision("high")
 
     # model init
@@ -334,6 +381,11 @@ if __name__ == "__main__":
     model.to(device)
     # use compiled model
     model.compile()
+
+    # wrap model in DDP
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model: GPT = model.module if ddp else model  # type: ignore
 
     # learning rate schedule from openai
     max_lr = 6e-4
@@ -358,7 +410,7 @@ if __name__ == "__main__":
         return lr / max_lr
 
     # create optimizer
-    optimizer = model.configure_optimizers(
+    optimizer = raw_model.configure_optimizers(
         weight_decay=0.1, learning_rate=max_lr, device=device
     )
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
@@ -367,7 +419,7 @@ if __name__ == "__main__":
     for i in range(max_steps):
         t0 = time.time()
         optimizer.zero_grad()
-        loss_accum = 0.0
+        loss_accum = torch.tensor(0.0, device=device)
         for micro_step in range(grad_accum_steps):  # accumulate gradients
             x, y = train_loader.next_batch()
             x, y = x.to(device), y.to(device)
@@ -377,8 +429,14 @@ if __name__ == "__main__":
             loss = (
                 loss / grad_accum_steps
             )  # Scale down the loss since gradient accumulation results in gradient of loss sum (we want gradient of loss mean)
-            loss_accum += loss.item()
+            loss_accum += loss.detach()
+            if ddp:
+                # only synchronize at the last micro step per gpu
+                model.require_backward_grad_sync = micro_step == grad_accum_steps - 1  # type: ignore
             loss.backward()
+        if ddp:
+            # calculate global average of loss accum (accross gpus)
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
         # clip gradients at 1.0 (same as openai)
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scheduler.step()
@@ -387,11 +445,17 @@ if __name__ == "__main__":
         torch.cuda.synchronize()
         t1 = time.time()
         dt = (t1 - t0) * 1000  # time diff in ms
-        tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
-        tokens_per_sec = tokens_processed / (t1 - t0)
-        print(
-            f"step {i:4d} | loss: {loss_accum:.6f} | lr: {scheduler.get_last_lr()[0]:.4e} | norm: {norm.item():.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
+        tokens_processed = (
+            train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
         )
+        tokens_per_sec = tokens_processed / (t1 - t0)
+        if master_process:
+            print(
+                f"step {i:4d} | loss: {loss_accum.item():.6f} | lr: {scheduler.get_last_lr()[0]:.4e} | norm: {norm.item():.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
+            )
+
+    if ddp:
+        dist.destroy_process_group()
 
     import sys
 
