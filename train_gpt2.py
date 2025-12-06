@@ -2,7 +2,9 @@ from typing import Optional
 from dataclasses import dataclass
 import math
 import inspect
+import os
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -260,25 +262,39 @@ class GPT(nn.Module):
         return optimizer
 
 
+def load_tokens(filename):
+    tokens_np = np.load(filename)
+    tokens = torch.from_numpy(tokens_np).long()
+    return tokens
+
+
 class DataLoaderLite:
-    def __init__(self, B: int, T: int, process_rank: int = 0, num_processes: int = 1):
+    def __init__(
+        self,
+        B: int,
+        T: int,
+        process_rank: int = 0,
+        num_processes: int = 1,
+        split: str = "train",
+    ):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        assert split in {"train", "val"}
 
-        with open("input.txt", "r") as f:
-            text = f.read()
-
-        enc = tiktoken.get_encoding("gpt2")
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-
+        # get the shard filenames based on the split
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        self.shards = [os.path.join(data_root, s) for s in sorted(shards)]
+        assert len(self.shards) > 0, f"no shards found for split {split}"
         if master_process:
-            print(f"loaded {len(self.tokens)} tokens")
-            print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
+            print(f"found {len(shards)} shards for split {split}")
 
-        # loader state
+        # init
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(
@@ -288,10 +304,12 @@ class DataLoaderLite:
         buf = self.tokens[self.current_position : self.current_position + B * T + 1]
         x = buf[:-1].view(B, T)
         y = buf[1:].view(B, T)
-        # update state
+        # advance positions in the self.tokens tensor (tokens of current shard)
         self.current_position += B * T * self.num_processes
-        # reset state if next batch will be out of bounds
+        # advance to next shard if next batch will be out of bounds
         if self.current_position + (B * T * self.num_processes) + 1 > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
             self.current_position = self.B * self.T * self.process_rank
         return x, y
 
@@ -353,7 +371,7 @@ if __name__ == "__main__":
     total_batch_size_in_tokens = (
         524288  # 524288 = 2^19, ~0.5M (used by openai for 124M gpt2)
     )
-    B = 4  # micro batch size (set this based on your available GPU memory)
+    B = 16  # micro batch size (set this based on your available GPU memory)
     T = 1024  # sequence length
     assert (
         total_batch_size_in_tokens % (B * T * ddp_world_size) == 0
@@ -365,7 +383,7 @@ if __name__ == "__main__":
 
     # data loader
     train_loader = DataLoaderLite(
-        B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size
+        B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train"
     )
 
     # try TF32
@@ -390,8 +408,12 @@ if __name__ == "__main__":
     # learning rate schedule from openai
     max_lr = 6e-4
     min_lr = max_lr * 0.1
-    warmup_steps = 10
-    max_steps = 50
+    warmup_steps = (
+        715  # openai gpt2 warms up for the first 375M tokens. 375M / 524288 = ~715.
+    )
+    max_steps = (
+        19073  # This is the steps for training for 10B tokens. 10B / 524288 = ~19073.
+    )
 
     def lr_lambda(step):
         # 1) linear warmup for warmup steps
@@ -416,7 +438,7 @@ if __name__ == "__main__":
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     # optimize
-    for i in range(max_steps):
+    for step in range(max_steps):
         t0 = time.time()
         optimizer.zero_grad()
         loss_accum = torch.tensor(0.0, device=device)
@@ -451,7 +473,7 @@ if __name__ == "__main__":
         tokens_per_sec = tokens_processed / (t1 - t0)
         if master_process:
             print(
-                f"step {i:4d} | loss: {loss_accum.item():.6f} | lr: {scheduler.get_last_lr()[0]:.4e} | norm: {norm.item():.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
+                f"step {step+1:4d}/{max_steps:4d} | loss: {loss_accum.item():.6f} | lr: {scheduler.get_last_lr()[0]:.4e} | norm: {norm.item():.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
             )
 
     if ddp:
