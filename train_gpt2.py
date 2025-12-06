@@ -293,6 +293,14 @@ class DataLoaderLite:
             print(f"found {len(shards)} shards for split {split}")
 
         # init
+        self.reset()
+
+    def reset(
+        self,
+    ):
+        """
+        Resets the dataloader to the initial state
+        """
         self.current_shard = 0
         self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
@@ -385,6 +393,9 @@ if __name__ == "__main__":
     train_loader = DataLoaderLite(
         B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train"
     )
+    val_loader = DataLoaderLite(
+        B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val"
+    )
 
     # try TF32
     if torch.cuda.is_tf32_supported():
@@ -440,6 +451,30 @@ if __name__ == "__main__":
     # optimize
     for step in range(max_steps):
         t0 = time.time()
+
+        # evaluate validation loss every 100 steps
+        if step % 100 == 0:
+            model.eval()
+            val_loader.reset()
+            with torch.no_grad():
+                val_loss_accum = torch.tensor(0.0, device=device)
+                val_loss_steps = 20
+                for _ in range(val_loss_steps):
+                    x, y = val_loader.next_batch()
+                    x, y = x.to(device), y.to(device)
+                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                        logits, loss = model(x, y)
+                    loss = loss / val_loss_steps
+                    val_loss_accum += loss.detach()
+            if ddp:
+                dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+            if master_process:
+                print(
+                    f"step {step:4d}/{max_steps:4d} | validation loss: {val_loss_accum.item():.6f}"
+                )
+
+        # training loop
+        model.train()
         optimizer.zero_grad()
         loss_accum = torch.tensor(0.0, device=device)
         for micro_step in range(grad_accum_steps):  # accumulate gradients
