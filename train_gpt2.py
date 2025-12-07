@@ -345,6 +345,12 @@ if __name__ == "__main__":
 
     # Args
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--ckpt",
+        type=str,
+        default=None,
+        help="Path to model checkpoint to load.",
+    )
     args = parser.parse_args()
 
     # Set device
@@ -421,6 +427,13 @@ if __name__ == "__main__":
     # use compiled model
     model.compile()
 
+    # load model checkpoint if provided
+    if args.ckpt:
+        if master_process:
+            print(f"loading model checkpoint from {args.ckpt}...")
+        checkpoint = torch.load(args.ckpt, map_location=device)
+        model.load_state_dict(checkpoint["model"])
+
     # wrap model in DDP
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
@@ -458,6 +471,13 @@ if __name__ == "__main__":
     )
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
+    # restore optimizer and scheduler state from model checkpoint if provided
+    if args.ckpt:
+        if master_process:
+            print(f"loading optimizer and scheduler state from {args.ckpt}...")
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])  # type: ignore
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])  # type: ignore
+
     # create gpt2 tokenizer (used for generation)
     enc = tiktoken.get_encoding("gpt2")
 
@@ -470,8 +490,18 @@ if __name__ == "__main__":
         with open(log_file, "w") as f:  # this will clear the file
             pass
 
+    # Set start step if resuming from checkpoint
+    if args.ckpt:
+        start_step = checkpoint["step"]  # type: ignore
+        # Update train dataloader state to this start_step
+        for step in range(start_step):
+            for micro_step in range(grad_accum_steps):
+                train_loader.next_batch()
+    else:
+        start_step = 0
+
     # optimize
-    for step in range(max_steps):
+    for step in range(start_step, max_steps):
         t0 = time.time()
         last_step = step == max_steps - 1
 
