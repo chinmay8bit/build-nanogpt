@@ -636,6 +636,11 @@ if __name__ == "__main__":
         for micro_step in range(grad_accum_steps):  # accumulate gradients
             x, y = train_loader.next_batch()
             x, y = x.to(device), y.to(device)
+            # ERRATA (karpathy): Confusingly, model.require_backward_grad_sync is actually used by both the forward and backward pass.
+            # Moved up the line so that it also gets applied to the forward pass.
+            if ddp:
+                # only synchronize at the last micro step per gpu
+                model.require_backward_grad_sync = micro_step == grad_accum_steps - 1  # type: ignore
             # use BF16
             with torch.autocast(device_type=device, dtype=torch.bfloat16):
                 logits, loss = model(x, y)
@@ -643,9 +648,6 @@ if __name__ == "__main__":
                 loss / grad_accum_steps
             )  # Scale down the loss since gradient accumulation results in gradient of loss sum (we want gradient of loss mean)
             loss_accum += loss.detach()
-            if ddp:
-                # only synchronize at the last micro step per gpu
-                model.require_backward_grad_sync = micro_step == grad_accum_steps - 1  # type: ignore
             loss.backward()
         if ddp:
             # calculate global average of loss accum (accross gpus)
