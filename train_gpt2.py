@@ -357,6 +357,13 @@ if __name__ == "__main__":
         default=1,
         help="Number of epochs to train for.",
     )
+    parser.add_argument(
+        "-B",
+        "--batch-size",
+        type=int,
+        default=16,
+        help="Micro batch size per GPU.",
+    )
     args = parser.parse_args()
 
     # Set device
@@ -401,7 +408,9 @@ if __name__ == "__main__":
     total_batch_size_in_tokens = (
         524288  # 524288 = 2^19, ~0.5M (used by openai for 124M gpt2)
     )
-    B = 16  # micro batch size (set this based on your available GPU memory)
+    B = (
+        args.batch_size
+    )  # micro batch size (set this based on your available GPU memory)
     T = 1024  # sequence length
     assert (
         total_batch_size_in_tokens % (B * T * ddp_world_size) == 0
