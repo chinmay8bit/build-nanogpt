@@ -431,7 +431,7 @@ if __name__ == "__main__":
     if args.ckpt:
         if master_process:
             print(f"loading model checkpoint from {args.ckpt}...")
-        checkpoint = torch.load(args.ckpt, map_location=device)
+        checkpoint = torch.load(args.ckpt, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint["model"])
 
     # wrap model in DDP
