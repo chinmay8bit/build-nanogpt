@@ -334,12 +334,18 @@ class DataLoaderLite:
 if __name__ == "__main__":
     import os
     import time
+    import argparse
+    import uuid
 
     import tiktoken
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel as DDP
 
     import hellaswag
+
+    # Args
+    parser = argparse.ArgumentParser()
+    args = parser.parse_args()
 
     # Set device
     # set up DDP (distributed data parallel)
@@ -456,11 +462,13 @@ if __name__ == "__main__":
     enc = tiktoken.get_encoding("gpt2")
 
     # create the log directory for saving checkpoints and logs
-    log_dir = "logs"
-    os.makedirs(log_dir, exist_ok=True)
+    log_dir = os.path.join("logs", f"run_{uuid.uuid4().hex[:6]}")
     log_file = os.path.join(log_dir, f"log.txt")
-    with open(log_file, "w") as f:  # this will clear the file
-        pass
+    if master_process:
+        os.makedirs(log_dir, exist_ok=True)
+        print(f"logging to file: {log_file}")
+        with open(log_file, "w") as f:  # this will clear the file
+            pass
 
     # optimize
     for step in range(max_steps):
