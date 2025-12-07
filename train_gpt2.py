@@ -351,6 +351,12 @@ if __name__ == "__main__":
         default=None,
         help="Path to model checkpoint to load.",
     )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=1,
+        help="Number of epochs to train for.",
+    )
     args = parser.parse_args()
 
     # Set device
@@ -446,8 +452,8 @@ if __name__ == "__main__":
         715  # openai gpt2 warms up for the first 375M tokens. 375M / 524288 = ~715.
     )
     max_steps = (
-        19073  # This is the steps for training for 10B tokens. 10B / 524288 = ~19073.
-    )
+        19073  # This is the steps for training for 10B tokens. 10B / 524288 = ~19073. (1 epoch)
+    ) * args.epochs
 
     def lr_lambda(step):
         # 1) linear warmup for warmup steps
