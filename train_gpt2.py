@@ -267,6 +267,7 @@ def load_tokens(filename):
     return tokens
 
 
+# TODO: Add shuffing of documents and/or shards (relevant for multi-epoch runs)
 class DataLoaderLite:
     def __init__(
         self,
@@ -490,6 +491,21 @@ if __name__ == "__main__":
                     f.write(
                         f"step {step:4d}/{max_steps:4d} | validation loss: {val_loss_accum.item():.6f}\n"
                     )
+                # save model checkpoints every 5000 steps
+                if (step != 0 and step % 5000 == 0) or last_step:
+                    ckpt_path = os.path.join(
+                        log_dir, "checkpoints", f"model_{step:05d}.pt"
+                    )
+                    checkpoint = {
+                        "model": raw_model.state_dict(),
+                        "config": raw_model.config,
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict(),
+                        "step": step,
+                        "val_loss": val_loss_accum.item(),
+                    }
+                    print(f"saving model checkpoint to {ckpt_path}...")
+                    torch.save(checkpoint, ckpt_path)
 
         # evaluate hellaswag every 250 steps
         if step % 250 == 0 or last_step:
