@@ -338,6 +338,8 @@ if __name__ == "__main__":
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel as DDP
 
+    import hellaswag
+
     # Set device
     # set up DDP (distributed data parallel)
     # torchrun command sets the env variables RANK, LOCAL_RANK and WORLD_SIZE
@@ -452,12 +454,20 @@ if __name__ == "__main__":
     # create gpt2 tokenizer (used for generation)
     enc = tiktoken.get_encoding("gpt2")
 
+    # create the log directory for saving checkpoints and logs
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"log.txt")
+    with open(log_file, "w") as f:  # this will clear the file
+        pass
+
     # optimize
     for step in range(max_steps):
         t0 = time.time()
+        last_step = step == max_steps - 1
 
-        # evaluate validation loss every 100 steps
-        if step % 100 == 0:
+        # evaluate validation loss every 250 steps
+        if step % 250 == 0 or last_step:
             model.eval()
             val_loader.reset()
             with torch.no_grad():
@@ -476,9 +486,51 @@ if __name__ == "__main__":
                 print(
                     f"step {step:4d}/{max_steps:4d} | validation loss: {val_loss_accum.item():.6f}"
                 )
+                with open(log_file, "a") as f:
+                    f.write(
+                        f"step {step:4d}/{max_steps:4d} | validation loss: {val_loss_accum.item():.6f}\n"
+                    )
 
-        # generate from the model every 100 steps
-        if step != 0 and step % 100 == 0:
+        # evaluate hellaswag every 250 steps
+        if step % 250 == 0 or last_step:
+            model.eval()
+            num_correct_norm = torch.tensor(0, dtype=torch.int32, device=device)
+            num_total = torch.tensor(0, dtype=torch.int32, device=device)
+            for i, example in enumerate(hellaswag.iterate_examples("val")):
+                # distribute examples across multiple GPUs (if available)
+                # only process examples where i % ddp_world_size == ddp_rank
+                if i % ddp_world_size != ddp_rank:
+                    continue
+                # render example
+                _, tokens, mask, label = hellaswag.render_example(example)
+                tokens = tokens.to(device)
+                mask = mask.to(device)
+                # get the logits
+                with torch.no_grad():
+                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                        logits, _ = model(tokens)
+                    pred, pred_norm, _, _ = hellaswag.get_most_likely_ending(
+                        tokens, mask, logits
+                    )
+                num_total += 1
+                if pred_norm == label:
+                    num_correct_norm += 1
+            # reduce the stats across all GPU processes
+            if ddp:
+                dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+                dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+            acc_norm = num_correct_norm / num_total
+            if master_process:
+                print(
+                    f"step {step:4d}/{max_steps:4d} | HellaSwag accuracy: {num_correct_norm.item()}/{num_total.item()}={acc_norm.item():.4f}"
+                )
+                with open(log_file, "a") as f:
+                    f.write(
+                        f"step {step:4d}/{max_steps:4d} | HellaSwag accuracy: {acc_norm.item():.4f}\n"
+                    )
+
+        # generate from the model every 250 steps
+        if (step != 0 and step % 250 == 0) or last_step:
             model.eval()
             num_return_sequences = 4
             max_length = 32
@@ -493,7 +545,8 @@ if __name__ == "__main__":
             sample_rng.manual_seed(42 + ddp_rank)  # unique seed for each gpu
             while xgen.size(1) < max_length:
                 with torch.no_grad():
-                    logits, _ = model(xgen)  # (B, T, vocab_size)
+                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                        logits, _ = model(xgen)  # (B, T, vocab_size)
                     # We are only interested in the logits at the last token
                     logits = logits[:, -1, :]  # (B, vocab_size)
                     probs = F.softmax(logits, dim=-1)
@@ -515,7 +568,7 @@ if __name__ == "__main__":
                 generated_text = enc.decode(generated_tokens)
                 print(f"rank {ddp_rank} sample {i}: {generated_text}")
 
-        # training loop
+        # training loop (one step of the optimization)
         model.train()
         optimizer.zero_grad()
         loss_accum = torch.tensor(0.0, device=device)
@@ -552,6 +605,10 @@ if __name__ == "__main__":
             print(
                 f"step {step+1:4d}/{max_steps:4d} | loss: {loss_accum.item():.6f} | lr: {scheduler.get_last_lr()[0]:.4e} | norm: {norm.item():.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
             )
+            with open(log_file, "a") as f:
+                f.write(
+                    f"step {step+1:4d}/{max_steps:4d} | train loss: {loss_accum.item():.6f}\n"
+                )
 
     if ddp:
         dist.destroy_process_group()

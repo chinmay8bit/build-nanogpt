@@ -29,6 +29,7 @@ The validation set of HellaSwag has a total of 10,042 examples.
 
 import os
 import json
+from typing import Tuple
 
 import requests
 import tiktoken
@@ -131,6 +132,43 @@ def iterate_examples(split):
             yield example
 
 
+def get_most_likely_ending(
+    tokens: torch.Tensor, mask: torch.Tensor, logits: torch.Tensor
+) -> Tuple[int, int, torch.Tensor, torch.Tensor]:
+    """
+    Helper function to get the most likely ending based on model logits for the tokens
+
+    Returns:
+    - pred: index of the most likely ending based on total loss
+    - pred_norm: index of the most likely ending based on average token loss
+    - sum_loss: tensor of total losses for each ending
+    - avg_loss: tensor of average token losses for each ending
+    """
+    # Set up the logits, target and mask for loss calculation
+    logits = logits[
+        ..., :-1, :
+    ].contiguous()  # we don't need the logit from the last token in each row
+    target = tokens[..., 1:].contiguous()
+    target_mask = mask[..., 1:].contiguous()
+
+    flat_logits = logits.view(-1, logits.size(-1))
+    flat_target = target.view(-1)
+    losses = F.cross_entropy(flat_logits, flat_target, reduction="none")
+    losses = losses.view_as(target)
+
+    # sum up the losses where target_mask is set (will ignore context and padding)
+    masked_losses = losses * target_mask
+    sum_loss = masked_losses.sum(dim=-1)  # sum over sequence length
+    avg_loss = sum_loss / target_mask.sum(dim=-1)
+
+    # now we have the total loss and average token loss for each of the 4 completions
+    # the completionn with the lowest loss is the most likely
+    pred = torch.argmin(sum_loss, dim=-1).item()
+    pred_norm = torch.argmin(avg_loss, dim=-1).item()
+
+    return int(pred), int(pred_norm), sum_loss, avg_loss
+
+
 @torch.no_grad()
 def evaluate(model_type, device):
     torch.set_float32_matmul_precision("high")  # use TF32
@@ -150,27 +188,10 @@ def evaluate(model_type, device):
 
         # get the logits
         logits: torch.Tensor = model(tokens).logits
-        # evaluate the autoregressive loss at all positions
-        logits = logits[
-            ..., :-1, :
-        ].contiguous()  # we don't need the logit from the last token in each row
-        target = tokens[..., 1:].contiguous()
-        target_mask = mask[..., 1:].contiguous()
-
-        flat_logits = logits.view(-1, logits.size(-1))
-        flat_target = target.view(-1)
-        losses = F.cross_entropy(flat_logits, flat_target, reduction="none")
-        losses = losses.view_as(target)
-
-        # sum up the losses where target_mask is set (will ignore context and padding)
-        masked_losses = losses * target_mask
-        sum_loss = masked_losses.sum(dim=-1)  # sum over sequence length
-        avg_loss = sum_loss / target_mask.sum(dim=-1)
-
-        # now we have the total loss and average token loss for each of the 4 completions
-        # the completionn with the lowest loss is the most likely
-        pred = torch.argmin(sum_loss, dim=-1).item()
-        pred_norm = torch.argmin(avg_loss, dim=-1).item()
+        # get the predictons
+        pred, pred_norm, sum_loss, avg_loss = get_most_likely_ending(
+            tokens, mask, logits
+        )
 
         # accumulate stats
         num_total += 1
