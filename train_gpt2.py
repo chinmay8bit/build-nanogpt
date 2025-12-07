@@ -505,6 +505,7 @@ if __name__ == "__main__":
                         "val_loss": val_loss_accum.item(),
                     }
                     print(f"saving model checkpoint to {ckpt_path}...")
+                    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
                     torch.save(checkpoint, ckpt_path)
 
         # evaluate hellaswag every 250 steps
